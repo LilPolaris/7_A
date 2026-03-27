@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>2048 小游戏</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="header">
+        <div>
+          <h1>2048</h1>
+          <p class="subtitle">使用方向键或 WASD 合并数字，尝试得到 2048！</p>
+        </div>
+        <div class="panel-group">
+          <div class="score-card">
+            <span>得分</span>
+            <strong id="score">0</strong>
+          </div>
+          <div class="score-card">
+            <span>最高分</span>
+            <strong id="best-score">0</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="new-game" type="button">新游戏</button>
+        <p id="message" class="message">开始游戏吧！</p>
+      </section>
+
+      <section class="board-wrapper">
+        <div id="board" class="board" aria-label="2048 游戏棋盘"></div>
+      </section>
+
+      <section class="controls">
+        <h2>操作说明</h2>
+        <ul>
+          <li>键盘：↑ ↓ ← → 或 W A S D</li>
+          <li>相同数字碰撞时会合并</li>
+          <li>无法移动时游戏结束</li>
+        </ul>
+      </section>
+    </main>
+
+    <script src="script.js"></script>
+  </body>
+</html>
