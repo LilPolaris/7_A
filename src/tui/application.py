@@ -30,12 +30,12 @@ class AgentCLI(App):
 
     def __init__(
         self,
-        command_handler: Callable[[str, "AgentCLI"], Awaitable[None]],
+        input_handler: Callable[[str, "AgentCLI"], Awaitable[None]],
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.command_handler = command_handler
+        self.input_handler = input_handler
         self.current_process: asyncio.subprocess.Process | None = None
         self.current_process_group_id: int | None = None
         self.current_process_input_fd: int | None = None
@@ -183,4 +183,4 @@ class AgentCLI(App):
         self.output_user(user_input)
         input_widget.value = ""
 
-        self.run_worker(self.command_handler(user_input, self))
+        self.run_worker(self.input_handler(user_input, self))
