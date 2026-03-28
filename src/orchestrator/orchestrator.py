@@ -12,6 +12,8 @@ from typing import Any, Awaitable, Callable, Protocol
 try:
     from .intent_classifier import (
         DEFAULT_MODEL,
+        INTENT_JSON_SCHEMA,
+        INTENT_JSON_SCHEMA_NAME,
         _make_fallback,
         classify_intent,
         get_advanced_context,
@@ -20,9 +22,12 @@ try:
         validate_intent_result,
     )
     from .llm_client import generate_text_response, get_api_mode, get_llm_client
+    from ..shell_agent import ShellAgent
 except ImportError:
     from intent_classifier import (  # type: ignore
         DEFAULT_MODEL,
+        INTENT_JSON_SCHEMA,
+        INTENT_JSON_SCHEMA_NAME,
         _make_fallback,
         classify_intent,
         get_advanced_context,
@@ -31,6 +36,10 @@ except ImportError:
         validate_intent_result,
     )
     from llm_client import generate_text_response, get_api_mode, get_llm_client  # type: ignore
+    try:
+        from src.shell_agent import ShellAgent  # type: ignore
+    except ImportError:
+        from shell_agent import ShellAgent  # type: ignore
 
 
 class OrchestratorOutput(Protocol):
@@ -39,12 +48,44 @@ class OrchestratorOutput(Protocol):
     def output_system(self, text: str, style: str = "") -> None:
         ...
 
+    def output_workflow(self, text: str, state: str = "info") -> None:
+        ...
+
     def output_llm(
         self,
         content: str,
         markdown: bool | None = None,
         language: str | None = None,
     ) -> None:
+        ...
+
+    async def stream_llm(
+        self,
+        content: str,
+        markdown: bool | None = None,
+        language: str | None = None,
+    ) -> None:
+        ...
+
+    async def confirm_shell_command(
+        self,
+        *,
+        command: str,
+        risk_level: str,
+        reason: str,
+        details: list[Any] | None = None,
+        confirm_label: str = "继续执行",
+    ) -> bool:
+        ...
+
+    async def prompt_clarification(
+        self,
+        *,
+        question: str,
+        options: list[str],
+        allow_manual: bool = True,
+        manual_prompt: str = "请输入补充信息...",
+    ) -> str | None:
         ...
 
 
@@ -61,6 +102,16 @@ class ConsoleOutput:
         del style
         print(text)
 
+    def output_workflow(self, text: str, state: str = "info") -> None:
+        prefixes = {
+            "running": "",
+            "done": "",
+            "info": "• ",
+            "warn": "⚠ ",
+            "error": "✖ ",
+        }
+        print(f"{prefixes.get(state, '• ')}{text}")
+
     def output_llm(
         self,
         content: str,
@@ -69,6 +120,71 @@ class ConsoleOutput:
     ) -> None:
         del markdown, language
         print(content)
+
+    async def stream_llm(
+        self,
+        content: str,
+        markdown: bool | None = None,
+        language: str | None = None,
+    ) -> None:
+        del markdown, language
+        print(content)
+
+    async def confirm_shell_command(
+        self,
+        *,
+        command: str,
+        risk_level: str,
+        reason: str,
+        details: list[Any] | None = None,
+        confirm_label: str = "继续执行",
+    ) -> bool:
+        print("\n" + "=" * 60)
+        print(f"[风险确认] level={risk_level}")
+        print(reason)
+        print(f"命令: {command}")
+        if details:
+            for detail in details:
+                plain = detail.plain if hasattr(detail, "plain") else str(detail)
+                print(f"  {plain}")
+        answer = input(f"{confirm_label}? [y/N]: ").strip().lower()
+        print("=" * 60 + "\n")
+        return answer in {"y", "yes"}
+
+    async def prompt_clarification(
+        self,
+        *,
+        question: str,
+        options: list[str],
+        allow_manual: bool = True,
+        manual_prompt: str = "请输入补充信息...",
+    ) -> str | None:
+        print("\n" + "=" * 60)
+        print(question)
+        for index, option in enumerate(options, start=1):
+            print(f"[{index}] {option}")
+        manual_index = len(options) + 1 if allow_manual else None
+        if manual_index is not None:
+            print(f"[{manual_index}] 手动输入...")
+        print("[0] 取消")
+
+        while True:
+            answer = input("请选择: ").strip()
+            if answer == "0":
+                print("=" * 60 + "\n")
+                return None
+            if answer.isdigit():
+                choice = int(answer)
+                if 1 <= choice <= len(options):
+                    print("=" * 60 + "\n")
+                    return options[choice - 1]
+                if manual_index is not None and choice == manual_index:
+                    manual_value = input(f"{manual_prompt}: ").strip()
+                    print("=" * 60 + "\n")
+                    return manual_value or None
+            elif allow_manual and answer:
+                print("=" * 60 + "\n")
+                return answer
 
 
 async def execute_command_async(command: str, ui: OrchestratorOutput | None = None) -> None:
@@ -125,25 +241,27 @@ class OrchestratorAgent:
         self.llm_client = llm_client or client
         self.model = model or DEFAULT_MODEL
         self.verbose = verbose
+        self.shell_agent = ShellAgent(llm_client=self.llm_client, model=self.model)
 
-    def _emit_route_summary(self, result: OrchestratorResult, ui: OrchestratorOutput) -> None:
-        intent = result.get("intent", "unknown")
-        confidence = float(result.get("confidence", 0.0))
-        risk_level = result.get("risk_level", "unknown")
+    @staticmethod
+    def _risk_label(risk_level: str) -> str:
+        return {
+            "low": "低风险",
+            "medium": "中风险",
+            "high": "高风险",
+        }.get(risk_level, risk_level or "未知风险")
 
-        ui.output_system(
-            f"[orchestrator] intent={intent} confidence={confidence:.2f} risk={risk_level}",
-            style="dim",
-        )
-
-        if intent in {"shell_agent", "tool_agent"}:
-            ui.output_system(
-                result.get("task_description", "未生成任务描述"),
-                style="bold cyan" if intent == "shell_agent" else "bold magenta",
-            )
-            context_passed = result.get("context_passed", [])
-            if context_passed:
-                ui.output_system(f"context_passed: {context_passed}", style="dim")
+    async def _stream_response(
+        self,
+        ui: OrchestratorOutput,
+        content: str,
+        *,
+        markdown: bool | None = None,
+        language: str | None = None,
+    ) -> None:
+        if not content:
+            return
+        await ui.stream_llm(content, markdown=markdown, language=language)
 
     @staticmethod
     def _build_clarification_markdown(result: OrchestratorResult) -> str:
@@ -154,6 +272,29 @@ class OrchestratorAgent:
 
         option_lines = "\n".join(f"- {option}" for option in options)
         return f"{question}\n\n{option_lines}"
+
+    async def _handle_shell_agent(
+        self,
+        user_input: str,
+        routed_task: OrchestratorResult,
+        ui: OrchestratorOutput,
+    ) -> OrchestratorResult:
+        """将 shell_agent 路由结果进一步交给真正的 ShellAgent。"""
+        ui.output_workflow("已将任务交给 Shell Agent", state="done")
+        task_description = routed_task.get("task_description")
+        if task_description:
+            ui.output_workflow(f"任务说明：{task_description}", state="info")
+        shell_result = await self.shell_agent.run(
+            routed_task,
+            ui,
+            self.shell_executor,
+            user_input=user_input,
+        )
+        return {
+            **routed_task,
+            "shell_agent_result": shell_result,
+            "status": shell_result.get("status", "handled"),
+        }
 
     async def handle_input(self, user_input: str, ui: OrchestratorOutput) -> OrchestratorResult:
         """后端统一输入入口：接收用户输入并回写前端。"""
@@ -167,24 +308,20 @@ class OrchestratorAgent:
                 ui.output_system("[提示] / 后面请输入要执行的命令", style="yellow")
                 return {"status": "invalid_command", "input": user_input}
 
-            if self.shell_executor is None:
-                ui.output_system(
-                    f"[orchestrator] 收到直接命令但未配置 shell_executor: {command}",
-                    style="bold yellow",
-                )
-                return {
-                    "status": "shell_command_pending",
-                    "intent": "shell_command",
-                    "command": command,
-                }
-
-            await self.shell_executor(command, ui)
+            ui.output_workflow("收到命令，准备进行审查", state="running")
+            direct_result = await self.shell_agent.run_direct_command(
+                command,
+                ui,
+                self.shell_executor,
+            )
             return {
-                "status": "shell_command_executed",
+                "status": direct_result.get("status", "shell_command_handled"),
                 "intent": "shell_command",
                 "command": command,
+                "shell_agent_result": direct_result,
             }
 
+        ui.output_workflow("正在分析用户意图...", state="running")
         result = await asyncio.to_thread(
             handle_intent,
             user_input,
@@ -193,13 +330,18 @@ class OrchestratorAgent:
             1,
             self.verbose,
         )
-        self._emit_route_summary(result, ui)
 
         intent = result.get("intent")
+        risk_level = result.get("risk_level", "low")
         if intent == "direct_answer":
+            ui.output_workflow(
+                f"已识别为直接回答任务（{self._risk_label(risk_level)}）",
+                state="done",
+            )
+            ui.output_workflow("正在整理回复...", state="running")
             reply = result.get("reply", "")
             if reply:
-                ui.output_llm(reply)
+                await self._stream_response(ui, reply)
             else:
                 reply = await asyncio.to_thread(
                     generate_text_response,
@@ -209,9 +351,29 @@ class OrchestratorAgent:
                     model=self.model,
                     temperature=0.7,
                 )
-                ui.output_llm(reply)
+                await self._stream_response(ui, reply)
         elif intent == "clarification":
-            ui.output_llm(self._build_clarification_markdown(result), markdown=True)
+            ui.output_workflow("当前信息不足，需要进一步澄清", state="warn")
+            await self._stream_response(
+                ui,
+                self._build_clarification_markdown(result),
+                markdown=True,
+            )
+        elif intent == "shell_agent":
+            ui.output_workflow(
+                f"已识别为 Shell 任务（{self._risk_label(risk_level)}）",
+                state="done",
+            )
+            return await self._handle_shell_agent(user_input, result, ui)
+        elif intent == "tool_agent":
+            ui.output_workflow(
+                f"已识别为 Tool Agent 任务（{self._risk_label(risk_level)}）",
+                state="done",
+            )
+            ui.output_workflow("Tool Agent 尚未接入，当前仅返回路由结果", state="warn")
+            task_description = result.get("task_description")
+            if task_description:
+                ui.output_workflow(f"任务说明：{task_description}", state="info")
 
         return result
 
@@ -299,7 +461,10 @@ reasoning -> confidence -> intent -> risk_level -> 专属字段
     \"intent\": \"shell_agent\" | \"tool_agent\",
     \"risk_level\": \"low\" | \"medium\" | \"high\",
     \"task_description\": \"给下级 Agent 的清晰任务描述\",
-    \"context_passed\": [\"提取出的关键参数\"]
+    \"context_passed\": [\"提取出的关键参数\"],
+    \"reply\": null,
+    \"question\": null,
+    \"options\": null
 }
 
 如果 intent 是 \"direct_answer\"：
@@ -308,7 +473,11 @@ reasoning -> confidence -> intent -> risk_level -> 专属字段
     \"confidence\": 1.0,
     \"intent\": \"direct_answer\",
     \"risk_level\": \"low\",
-    \"reply\": \"完整回答\"
+    \"task_description\": null,
+    \"context_passed\": null,
+    \"reply\": \"完整回答\",
+    \"question\": null,
+    \"options\": null
 }
 
 如果 intent 是 \"clarification\"：
@@ -317,6 +486,9 @@ reasoning -> confidence -> intent -> risk_level -> 专属字段
     \"confidence\": 0.4,
     \"intent\": \"clarification\",
     \"risk_level\": \"low\",
+    \"task_description\": null,
+    \"context_passed\": null,
+    \"reply\": null,
     \"question\": \"追问问题\",
     \"options\": [\"候选项1\", \"候选项2\", \"其他\"]
 }"""
@@ -328,7 +500,8 @@ reasoning -> confidence -> intent -> risk_level -> 专属字段
             llm_client=client,
             model=DEFAULT_MODEL,
             temperature=0.1,
-            json_mode=True,
+            json_schema=INTENT_JSON_SCHEMA,
+            json_schema_name=INTENT_JSON_SCHEMA_NAME,
         )
         parsed = parse_llm_json(raw_text)
         if parsed:

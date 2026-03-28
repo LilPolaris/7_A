@@ -3,13 +3,14 @@
 import asyncio
 import os
 import signal
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Header, Input
 
 from .command_input import CommandInput
+from .dialogs import InteractionPanel
 from .footer import AgentFooter
 from .log_view import AgentRichLog
 
@@ -20,6 +21,7 @@ class AgentCLI(App):
     CSS = """
     Screen { layout: vertical; }
     #log_area { height: 1fr; border: solid green; }
+    #interaction_panel { height: auto; }
     #command_input { height: 3; }
     """
 
@@ -44,6 +46,7 @@ class AgentCLI(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield AgentRichLog(id="log_area")
+        yield InteractionPanel(id="interaction_panel")
         yield CommandInput(
             placeholder="输入 Prompt，或输入 / + CLI 命令以直接执行...",
             id="command_input",
@@ -124,6 +127,10 @@ class AgentCLI(App):
         """流式输出系统日志或 Shell 命令回显"""
         self.query_one("#log_area", AgentRichLog).write_system_message(text, style=style)
 
+    def output_workflow(self, text: str, state: str = "info") -> None:
+        """输出流程状态日志。"""
+        self.query_one("#log_area", AgentRichLog).write_workflow_message(text, state=state)
+
     def output_llm(
         self,
         content: str,
@@ -137,8 +144,59 @@ class AgentCLI(App):
             language=language,
         )
 
+    async def stream_llm(
+        self,
+        content: str,
+        markdown: bool | None = None,
+        language: str | None = None,
+    ) -> None:
+        """以逐步刷新的形式输出 LLM 内容。"""
+        await self.query_one("#log_area", AgentRichLog).stream_llm_message(
+            content,
+            markdown=markdown,
+            language=language,
+        )
+
+    async def confirm_shell_command(
+        self,
+        *,
+        command: str,
+        risk_level: str,
+        reason: str,
+        details: list[Any] | None = None,
+        confirm_label: str = "继续执行",
+    ) -> bool:
+        """在日志区和输入框之间显示风险确认面板。"""
+        result = await self.query_one("#interaction_panel", InteractionPanel).request_confirmation(
+            command=command,
+            risk_level=risk_level,
+            reason=reason,
+            details=details,
+            confirm_label=confirm_label,
+        )
+        return bool(result)
+
+    async def prompt_clarification(
+        self,
+        *,
+        question: str,
+        options: list[str],
+        allow_manual: bool = True,
+        manual_prompt: str = "请输入补充信息...",
+    ) -> str | None:
+        """在日志区和输入框之间显示澄清面板。"""
+        return await self.query_one("#interaction_panel", InteractionPanel).request_clarification(
+            question=question,
+            options=options,
+            allow_manual=allow_manual,
+            manual_prompt=manual_prompt,
+        )
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         """接收输入框提交，并交给后端处理"""
+        if event.input.id != "command_input":
+            return
+
         user_input = event.value.strip()
         if not user_input:
             return

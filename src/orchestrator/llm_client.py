@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -115,6 +115,40 @@ def _prepare_responses_input(user_input: str, *, json_mode: bool) -> str:
     )
 
 
+def _build_chat_json_schema_response_format(
+    *,
+    schema_name: str,
+    schema: dict[str, Any],
+    strict: bool,
+) -> dict[str, Any]:
+    """为 Chat Completions 构造 structured output 参数。"""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "schema": schema,
+            "strict": strict,
+        },
+    }
+
+
+def _build_responses_json_schema_text_format(
+    *,
+    schema_name: str,
+    schema: dict[str, Any],
+    strict: bool,
+) -> dict[str, Any]:
+    """为 Responses API 构造 structured output 参数。"""
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": schema_name,
+            "schema": schema,
+            "strict": strict,
+        }
+    }
+
+
 def generate_text_response(
     system_prompt: str,
     user_input: str,
@@ -123,20 +157,34 @@ def generate_text_response(
     model: str | None = None,
     temperature: float = 0.1,
     json_mode: bool = False,
+    json_schema: dict[str, Any] | None = None,
+    json_schema_name: str = "structured_output",
+    json_schema_strict: bool = True,
 ) -> str:
     """根据已检测的接口类型发起非流式调用并返回文本。"""
     llm_client = llm_client or _CLIENT
     model = model or DEFAULT_MODEL
     api_mode = get_api_mode(llm_client)
+    use_structured_output = json_schema is not None
 
     if api_mode == "responses":
         request_kwargs = {
             "model": model,
             "instructions": system_prompt,
-            "input": _prepare_responses_input(user_input, json_mode=json_mode),
+            "input": (
+                user_input
+                if use_structured_output
+                else _prepare_responses_input(user_input, json_mode=json_mode)
+            ),
             "temperature": temperature,
         }
-        if json_mode and _supports_json_mode(model):
+        if use_structured_output:
+            request_kwargs["text"] = _build_responses_json_schema_text_format(
+                schema_name=json_schema_name,
+                schema=json_schema,
+                strict=json_schema_strict,
+            )
+        elif json_mode and _supports_json_mode(model):
             request_kwargs["text"] = {"format": {"type": "json_object"}}
 
         full_response = ""
@@ -148,6 +196,8 @@ def generate_text_response(
 
                 stream.get_final_response()
         except Exception:
+            if use_structured_output:
+                raise
             if json_mode and "text" in request_kwargs:
                 request_kwargs.pop("text", None)
                 full_response = ""
@@ -169,7 +219,13 @@ def generate_text_response(
         ],
         "temperature": temperature,
     }
-    if json_mode and _supports_json_mode(model):
+    if use_structured_output:
+        request_kwargs["response_format"] = _build_chat_json_schema_response_format(
+            schema_name=json_schema_name,
+            schema=json_schema,
+            strict=json_schema_strict,
+        )
+    elif json_mode and _supports_json_mode(model):
         request_kwargs["response_format"] = {"type": "json_object"}
 
     response = llm_client.chat.completions.create(**request_kwargs)

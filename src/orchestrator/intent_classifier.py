@@ -33,14 +33,25 @@ except ImportError:
 
 client = get_llm_client()
 IntentResult = dict[str, Any]
+INTENT_JSON_SCHEMA_NAME = "intent_routing_result"
 
 # === 1. JSON Schema 定义（用于 jsonschema 校验）===
 INTENT_JSON_SCHEMA = {
     "type": "object",
-    "required": ["reasoning", "confidence", "intent", "risk_level"],
+    "required": [
+        "reasoning",
+        "confidence",
+        "intent",
+        "risk_level",
+        "task_description",
+        "context_passed",
+        "reply",
+        "question",
+        "options",
+    ],
     "additionalProperties": False,
     "properties": {
-        "reasoning": {"type": "string", "minLength": 1},
+        "reasoning": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "intent": {
             "type": "string",
@@ -50,26 +61,37 @@ INTENT_JSON_SCHEMA = {
             "type": "string",
             "enum": ["low", "medium", "high"],
         },
-        "task_description": {"type": "string", "minLength": 1},
-        "context_passed": {"type": "array", "items": {"type": "string"}},
-        "reply": {"type": "string", "minLength": 1},
-        "question": {"type": "string", "minLength": 1},
-        "options": {"type": "array", "items": {"type": "string"}},
+        "task_description": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
+        "context_passed": {
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "null"},
+            ]
+        },
+        "reply": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
+        "question": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
+        "options": {
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "null"},
+            ]
+        },
     },
-    "oneOf": [
-        {
-            "properties": {"intent": {"enum": ["shell_agent", "tool_agent"]}},
-            "required": ["task_description", "context_passed"],
-        },
-        {
-            "properties": {"intent": {"const": "direct_answer"}},
-            "required": ["reply"],
-        },
-        {
-            "properties": {"intent": {"const": "clarification"}},
-            "required": ["question", "options"],
-        },
-    ],
 }
 
 # Confidence 阈值常量
@@ -152,7 +174,10 @@ def get_system_prompt(context: dict[str, str]) -> str:
     "intent": "shell_agent" | "tool_agent",
     "risk_level": "low" | "medium" | "high",
     "task_description": "将用户的话转化为专业、清晰的任务指令，提供给下级 Agent",
-    "context_passed": ["提取出的文件名、路径或关键参数"]
+    "context_passed": ["提取出的文件名、路径或关键参数"],
+    "reply": null,
+    "question": null,
+    "options": null
 }}
 
 >>> 如果 intent 是 "direct_answer"：
@@ -161,7 +186,11 @@ def get_system_prompt(context: dict[str, str]) -> str:
     "confidence": 1.0,
     "intent": "direct_answer",
     "risk_level": "low",
-    "reply": "直接在这里写出完整的回答内容，一步到位"
+    "task_description": null,
+    "context_passed": null,
+    "reply": "直接在这里写出完整的回答内容，一步到位",
+    "question": null,
+    "options": null
 }}
 
 >>> 如果 intent 是 "clarification"：
@@ -170,6 +199,9 @@ def get_system_prompt(context: dict[str, str]) -> str:
     "confidence": 0.4,
     "intent": "clarification",
     "risk_level": "low",
+    "task_description": null,
+    "context_passed": null,
+    "reply": null,
     "question": "向用户提出礼貌的追问，例如：请问您要删除的是当前目录的 test.py 还是 src 目录下的？",
     "options": ["候选选项1", "候选选项2", "其他"]
 }}
@@ -180,9 +212,17 @@ def get_system_prompt(context: dict[str, str]) -> str:
 def parse_llm_json(raw_text: str) -> IntentResult | None:
     """三层容错机制解析 LLM 返回的 JSON。"""
     raw_text = raw_text.strip()
+    decoder = json.JSONDecoder()
 
     try:
         return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        parsed, _ = decoder.raw_decode(raw_text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
 
@@ -199,9 +239,11 @@ def parse_llm_json(raw_text: str) -> IntentResult | None:
         pass
 
     try:
-        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        match = re.search(r"\{", raw_text)
         if match:
-            return json.loads(match.group())
+            parsed, _ = decoder.raw_decode(raw_text[match.start() :])
+            if isinstance(parsed, dict):
+                return parsed
     except json.JSONDecodeError:
         pass
 
@@ -215,21 +257,136 @@ def validate_intent_result(data: IntentResult) -> tuple[bool, str]:
         validate(instance=data, schema=INTENT_JSON_SCHEMA)
         if data["confidence"] < CONFIDENCE_LOW and data["intent"] != "clarification":
             return False, "confidence < 0.5 时 intent 必须为 clarification"
-        if data["intent"] == "direct_answer" and data["risk_level"] != "low":
-            return False, "direct_answer 的 risk_level 必须为 low"
+        intent = data["intent"]
+
+        if intent == "direct_answer":
+            if data["risk_level"] != "low":
+                return False, "direct_answer 的 risk_level 必须为 low"
+            if not isinstance(data.get("reply"), str) or not data["reply"].strip():
+                return False, "direct_answer 必须提供非空 reply"
+        elif intent == "clarification":
+            if not isinstance(data.get("question"), str) or not data["question"].strip():
+                return False, "clarification 必须提供非空 question"
+            if not isinstance(data.get("options"), list):
+                return False, "clarification 必须提供 options 列表"
+        elif intent in {"shell_agent", "tool_agent"}:
+            if not isinstance(data.get("task_description"), str) or not data["task_description"].strip():
+                return False, f"{intent} 必须提供非空 task_description"
+            if not isinstance(data.get("context_passed"), list):
+                return False, f"{intent} 必须提供 context_passed 列表"
+
         return True, ""
     except ValidationError as exc:
         return False, f"Schema 校验失败: {exc.message}"
 
 
 # === 6. 降级与后处理 ===
+def _infer_fallback_risk(text: str) -> str:
+    """基于候选命令/文本粗略推断风险级别。"""
+    lowered = text.lower()
+    high_risk_markers = [
+        "rm ",
+        "rm\t",
+        "删除",
+        "sudo",
+        "mkfs",
+        "dd ",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "chmod 777",
+    ]
+    medium_risk_markers = [
+        "mv ",
+        "cp ",
+        "mkdir",
+        "touch ",
+        "写入",
+        "修改",
+        "重命名",
+        "移动",
+        "复制",
+        "创建",
+    ]
+
+    if any(marker in lowered for marker in high_risk_markers):
+        return "high"
+    if any(marker in lowered for marker in medium_risk_markers):
+        return "medium"
+    return "low"
+
+
+def _looks_like_shell_request(user_input: str) -> bool:
+    """判断用户输入是否更像本地命令/文件系统任务。"""
+    lowered = user_input.lower()
+    shell_markers = [
+        "删除",
+        "列出",
+        "查看",
+        "执行",
+        "运行",
+        "查找",
+        "搜索",
+        "创建",
+        "新建",
+        "修改",
+        "移动",
+        "复制",
+        "重命名",
+        "打开文件",
+        "读取文件",
+        "当前目录",
+        "目录",
+        "文件",
+        "终端",
+        "命令",
+        "shell",
+        "ls",
+        "pwd",
+        "grep",
+        "find",
+        "cat ",
+        "git ",
+        "python ",
+        "pip ",
+    ]
+    return any(marker in lowered for marker in shell_markers)
+
+
+def _looks_like_human_answer(text: str) -> bool:
+    """判断文本更像自然语言回答，而不是命令/错误/机器结果。"""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    machine_markers = [
+        '"command"',
+        '"error"',
+        '"stderr"',
+        '"stdout"',
+        '"returncode"',
+        "traceback",
+        "exception",
+        "rm ",
+        "ls ",
+        "pwd",
+    ]
+    if stripped.startswith("{") or stripped.startswith("["):
+        return False
+    if any(marker in lowered for marker in machine_markers):
+        return False
+    return True
+
+
 def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
     """生成降级 fallback 结果。"""
     raw_text = raw_text.strip()
     extracted_text = raw_text
     extracted_key = ""
+    parsed_raw: dict[str, Any] | None = None
     try:
-        parsed_raw = json.loads(raw_text)
+        candidate = json.loads(raw_text)
+        parsed_raw = candidate if isinstance(candidate, dict) else None
         if isinstance(parsed_raw, dict):
             for key in ("reply", "answer", "response", "message", "content", "text"):
                 value = parsed_raw.get(key)
@@ -241,6 +398,7 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
         pass
 
     lowered_input = user_input.lower()
+    looks_like_shell_request = _looks_like_shell_request(user_input)
     clarification_markers = [
         "请问",
         "能否",
@@ -266,6 +424,53 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
         "是谁",
     ]
 
+    if parsed_raw:
+        explicit_intent = parsed_raw.get("intent")
+        if explicit_intent in {"shell_agent", "tool_agent"}:
+            task_description = parsed_raw.get("task_description") or parsed_raw.get("command")
+            context_passed = parsed_raw.get("context_passed")
+            if isinstance(task_description, str) and task_description.strip():
+                return {
+                    "intent": explicit_intent,
+                    "reasoning": f"结构化解析失败，但模型已给出可路由任务，降级沿用 {explicit_intent}。原始内容: {raw_text[:200]}",
+                    "confidence": 0.55,
+                    "risk_level": parsed_raw.get("risk_level") or _infer_fallback_risk(task_description),
+                    "task_description": task_description.strip(),
+                    "context_passed": context_passed if isinstance(context_passed, list) else [],
+                    "reply": None,
+                    "question": None,
+                    "options": None,
+                }
+
+        command = parsed_raw.get("command")
+        if isinstance(command, str) and command.strip():
+            inferred_risk = _infer_fallback_risk(command)
+            return {
+                "intent": "shell_agent",
+                "reasoning": f"结构化解析失败，但模型返回了命令候选，降级为 shell_agent。原始内容: {raw_text[:200]}",
+                "confidence": 0.55,
+                "risk_level": inferred_risk,
+                "task_description": f"根据用户请求生成并安全执行与下述候选命令等价的 shell 操作：{command.strip()}",
+                "context_passed": [command.strip()],
+                "reply": None,
+                "question": None,
+                "options": None,
+            }
+
+        error_text = parsed_raw.get("error") or parsed_raw.get("reason")
+        if looks_like_shell_request and isinstance(error_text, str) and error_text.strip():
+            return {
+                "intent": "clarification",
+                "reasoning": f"结构化解析失败，且模型返回了拒绝/错误信息，保守降级为 clarification。原始内容: {raw_text[:200]}",
+                "confidence": 0.0,
+                "risk_level": "low",
+                "task_description": None,
+                "context_passed": None,
+                "reply": None,
+                "question": error_text.strip(),
+                "options": ["补充目标路径", "补充更具体操作", "直接用 /命令 执行"],
+            }
+
     looks_like_clarification = any(marker in raw_text for marker in clarification_markers)
     looks_like_clarification = looks_like_clarification or any(
         marker in extracted_text for marker in clarification_markers
@@ -273,12 +478,19 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
     looks_like_direct_answer = (
         bool(extracted_text)
         and (
-            extracted_key in {"reply", "answer", "response", "content", "text"}
-            or
-            any(marker in lowered_input for marker in direct_answer_markers)
-            or user_input.endswith(("?", "？"))
-            or len(extracted_text) >= 24
+            (
+                extracted_key in {"reply", "answer", "response", "content", "text"}
+                and _looks_like_human_answer(extracted_text)
+            )
+            or (
+                _looks_like_human_answer(extracted_text)
+                and (
+                    any(marker in lowered_input for marker in direct_answer_markers)
+                    or user_input.endswith(("?", "？"))
+                )
+            )
         )
+        and not looks_like_shell_request
     )
 
     if looks_like_direct_answer and not looks_like_clarification:
@@ -288,6 +500,10 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
             "confidence": 0.6,
             "risk_level": "low",
             "reply": extracted_text,
+            "task_description": None,
+            "context_passed": None,
+            "question": None,
+            "options": None,
         }
 
     return {
@@ -295,12 +511,19 @@ def _make_fallback(user_input: str, raw_text: str) -> IntentResult:
         "reasoning": f"JSON 解析/校验失败，自动降级为 clarification。原始内容: {raw_text[:200]}",
         "confidence": 0.0,
         "risk_level": "low",
+        "task_description": None,
+        "context_passed": None,
+        "reply": None,
         "question": (
             extracted_text
             if looks_like_clarification and extracted_text
             else f"我暂时无法可靠判断你的意图。你是希望我处理这个任务吗：{user_input}"
         ),
-        "options": ["shell_agent", "tool_agent", "direct_answer", "其他"],
+        "options": (
+            ["补充目标路径", "补充更具体操作", "直接用 /命令 执行"]
+            if looks_like_shell_request
+            else ["shell_agent", "tool_agent", "direct_answer", "其他"]
+        ),
     }
 
 
@@ -341,7 +564,8 @@ def classify_intent(
                 llm_client=llm_client,
                 model=model,
                 temperature=0.1,
-                json_mode=True,
+                json_schema=INTENT_JSON_SCHEMA,
+                json_schema_name=INTENT_JSON_SCHEMA_NAME,
             )
             if verbose:
                 print(f"\n[LLM 原始返回]\n{raw_text}\n")
